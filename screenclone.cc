@@ -8,6 +8,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <list>
 
 #include <sys/ipc.h>
 #include <sys/shm.h>
@@ -268,15 +269,14 @@ struct image_replayer {
 
 struct mouse_replayer {
 	const display src, dst;
-	const xinerama_screen src_screen;
-	const xinerama_screen dst_screen;
 	window dst_window;
 	Cursor invisibleCursor;
 	volatile bool on;
 	std::recursive_mutex cursor_mutex;
+	std::vector<std::pair<const xinerama_screen*,const xinerama_screen *> > screens;
 
-	mouse_replayer( const display &_src, const display &_dst, const xinerama_screen &_src_screen, const xinerama_screen &_dst_screen )
-		: src( _src ), dst( _dst), src_screen( _src_screen ), dst_screen( _dst_screen ), dst_window( dst.root() )
+	mouse_replayer( const display &_src, const display &_dst)
+		: src( _src ), dst( _dst), dst_window( dst.root() )
 		, on( false )
 	{
 		// create invisible cursor
@@ -290,6 +290,9 @@ struct mouse_replayer {
 				&black, &black, 0, 0);
 
 		dst_window.define_cursor( invisibleCursor );
+	}
+	void add_screen(const xinerama_screen &src_screen, const xinerama_screen &dst_screen) {
+		screens.emplace_back(&src_screen, &dst_screen);
 	}
 
 	void operator() ( XRecordInterceptData *data ) {
@@ -308,10 +311,16 @@ struct mouse_replayer {
 		std::lock_guard< std::recursive_mutex > guard( cursor_mutex );
 
 		bool old_on = on;
-		on = src_screen.in_screen( x, y );
+		auto on_screen = screens.begin();
+		for(; on_screen != screens.end(); ++on_screen) {
+			if(on_screen->first->in_screen(x,y)) {
+				break;
+			}
+		}
+		on = on_screen != screens.end();
 
 		if ( on )
-			dst_window.warp_pointer( x - src_screen.info.x_org + dst_screen.info.x_org, y - src_screen.info.y_org + dst_screen.info.y_org );
+			dst_window.warp_pointer( x - on_screen->first->info.x_org + on_screen->second->info.x_org, y - on_screen->first->info.y_org + on_screen->second->info.y_org );
 		else
 			// wiggle the cursor a bit to keep screensaver away
 			dst_window.warp_pointer( x % 50, y % 50 );
@@ -387,8 +396,7 @@ int main( int argc, char *argv[] )
 	XInitThreads();
 
 	std::string src_name( ":0" ), dst_name( ":1" );
-	unsigned src_screen_number = 0;
-	unsigned dst_screen_number = 0;
+	std::vector<std::pair<unsigned, unsigned> > screen_number;
 
 	int opt;
 	while ( ( opt = getopt( argc, argv, "s:d:x:h" ) ) != -1 )
@@ -400,14 +408,14 @@ int main( int argc, char *argv[] )
 			dst_name = optarg;
 			break;
 		case 'x':
-			src_screen_number = atoi( optarg );
 			{
+				unsigned src_screen_number = atoi(optarg);
+				unsigned dst_screen_number = 0;
 				char *dstarg = strchr(optarg,':');
 				if(dstarg) {
-					fprintf(stderr,"dest screen arg %s\n",dstarg);
 					dst_screen_number = atoi(dstarg+1);
-					fprintf(stderr,"dest screen %d\n",dst_screen_number);
 				}
+				screen_number.emplace_back(src_screen_number,dst_screen_number);
 			}
 			break;
 		default:
@@ -418,19 +426,28 @@ int main( int argc, char *argv[] )
 		ERR;
 	display src( src_name ), dst( dst_name );
 
+	if(screen_number.empty()) {
+		screen_number.emplace_back(0,0);
+	}
+
+	std::list<image_replayer> image;
+	mouse_replayer mouse( src.clone(), dst );
+
 	auto src_screens = src.xinerama_screens();
-	if ( src_screen_number < 0 || src_screen_number >= src_screens.size() )
-		ERR;
-	auto &src_screen = src_screens[ src_screen_number ];
-
 	auto dst_screens = dst.xinerama_screens();
-	if ( dst_screen_number < 0 || dst_screen_number >= dst_screens.size() )
-		ERR;
-	auto &dst_screen = dst_screens[ dst_screen_number ];
+	for(auto i = screen_number.begin(); i != screen_number.end(); ++i) {
+		if ( i->first < 0 || i->first >= src_screens.size() )
+			ERR;
+		auto &src_screen = src_screens[ i->first ];
 
-	// Clone src not to fight with the blocking loop.
-	mouse_replayer mouse( src.clone(), dst, src_screen, dst_screen );
-	image_replayer image( src, dst, src_screen, dst_screen );
+		if ( i->second < 0 || i->second >= dst_screens.size() )
+			ERR;
+		auto &dst_screen = dst_screens[ i->second ];
+
+		image.emplace_back(src,dst,src_screen, dst_screen);
+
+		mouse.add_screen(src_screen, dst_screen);
+	}
 
 	window root = src.root();
 	root.create_damage();
@@ -443,13 +460,17 @@ int main( int argc, char *argv[] )
 			const XEvent e = src.next_event();
 			if ( e.type == src.damage_event + XDamageNotify ) {
 				const XDamageNotifyEvent &de = * (const XDamageNotifyEvent *) &e;
-				image.damage( de.area );
+				for(auto i = image.begin(); i != image.end(); ++i) {
+					i->damage( de.area );
+				}
 			} else if ( e.type == src.xfixes_event + XFixesCursorNotify ) {
 				mouse.cursor_changed();
 			}
 		} while ( src.pending() );
 
 		root.clear_damage();
-		image.copy_if_damaged();
+		for(auto i = image.begin(); i != image.end(); ++i) {
+			i->copy_if_damaged();
+		}
 	}
 }
