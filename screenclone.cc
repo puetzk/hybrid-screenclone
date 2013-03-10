@@ -14,6 +14,9 @@
 #include <sys/shm.h>
 #include <sys/select.h>
 #include <sys/time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <X11/Xcursor/Xcursor.h>
@@ -388,7 +391,8 @@ void usage( const char *name )
 		<< " -s <display name> (default :0)" << std::endl
 		<< " -d <display name> (default :1)" << std::endl
 		<< " -x <xinerama screen number> (default 0:0)" << std::endl
-		<< " or -x <source screen number>:<dest screen number> (can be repeated)" << std::endl;
+		<< " or -x <source screen number>:<dest screen number> (can be repeated)" << std::endl
+		<< " -b <path to bumblebee socket> (default /var/run/bumblebee.socket)" << std::endl;
 	exit( 0 );
 }
 
@@ -396,11 +400,12 @@ int main( int argc, char *argv[] )
 {
 	XInitThreads();
 
-	std::string src_name( ":0" ), dst_name( ":1" );
+	std::string src_name( ":0" ), dst_name;
 	std::vector<std::pair<unsigned, unsigned> > screen_number;
+	bool bumblebee = false;
 
 	int opt;
-	while ( ( opt = getopt( argc, argv, "s:d:x:h" ) ) != -1 )
+	while ( ( opt = getopt( argc, argv, "s:d:x:h:b" ) ) != -1 )
 		switch ( opt ) {
 		case 's':
 			src_name = optarg;
@@ -419,9 +424,47 @@ int main( int argc, char *argv[] )
 				screen_number.emplace_back(src_screen_number,dst_screen_number);
 			}
 			break;
+		case 'b':
+			bumblebee = true;
+			break;
+
 		default:
 			usage( argv[ 0 ] );
 		}
+
+	if(bumblebee) {
+		int sock = socket(PF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+		struct sockaddr_un addr;
+		addr.sun_family = AF_UNIX;
+
+		strcpy(addr.sun_path, optarg && *optarg ? optarg : "/var/run/bumblebee.socket");
+		connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+		if(errno) ERR;
+
+		// ask bumblebee to start up the secondary X
+		static char c[256] = "C";
+		send(sock, &c, 1, 0);
+		recv(sock, &c, 255, 0);
+		if(c[0] == 'N') fprintf(stderr,"Bumblebee GL check failed: %s\n", c + 5);
+		else if(c[0] != 'Y') fprintf(stderr,"failure contacting Bumblebee daemon\n");
+
+		if(dst_name.empty()) {
+			// ask bumblebee which screen we're on
+			strcpy(c,"Q VirtualDisplay");
+			send(sock, &c, 17, 0);
+			recv(sock, &c, 255, 0);
+			if(strncmp(c,"Value: ",7) == 0) {
+				char *arg = c+7;
+				char *newline = strchr(arg,'\n');
+				if(newline) *newline = '\0';
+				dst_name=arg;
+			} else {
+				fprintf(stderr,"Bumblebee VirtualDisplay failed: %s\n",c);
+			}
+		}
+	} else { // no user setting, no bumblebee, just guess
+		dst_name = ":1";
+	}
 
 	if ( src_name == dst_name )
 		ERR;
