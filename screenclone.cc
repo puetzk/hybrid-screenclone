@@ -387,7 +387,8 @@ void usage( const char *name )
 		<< "Options:" << std::endl
 		<< " -s <display name> (default :0)" << std::endl
 		<< " -d <display name> (default :1)" << std::endl
-		<< " -x <xinerama screen number> (default 0)" << std::endl;
+		<< " -x <xinerama screen number> (default 0:0)" << std::endl
+		<< " or -x <source screen number>:<dest screen number> (can be repeated)" << std::endl;
 	exit( 0 );
 }
 
